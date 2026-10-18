@@ -22,6 +22,7 @@ __pycache__/
 
 .env
 .env.*
+!.env.example
 
 
 # ==============================
@@ -52,6 +53,7 @@ __pycache__/
 
 *.tmp
 *.temp
+temp_uploads/
 
 
 # ==============================
@@ -79,11 +81,15 @@ htmlcov/
 uploads/
 documents/
 *.pdf
+*.docx
 
 
 # ==============================
-# Local Data
+# Local Data & Queue DB
 # ==============================
 
 data/
 storage/
+*.db
+*.db-shm
+*.db-wal

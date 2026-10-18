@@ -4,3 +4,6 @@ python-multipart==0.0.32
 ollama==0.6.2
 pypdf==6.19.0
 pydantic==2.13.5
+python-docx>=1.1.2
+pymupdf>=1.24.0
+rapidocr-onnxruntime>=1.4.4
