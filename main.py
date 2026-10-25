@@ -233,10 +233,48 @@ def init_db():
                     value_currency CHAR(3) NULL,
                     warnings_json TEXT NULL,
                     result_json LONGTEXT NOT NULL,
-                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NULL,
+                    INDEX idx_agreements_number_vendor (agreement_number, vendor_customer)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """
             )
+            # Links every processed file (by SHA-256) to its agreement, so older copies
+            # are still recognised after a rescan has updated the agreements row
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agreement_files (
+                    file_sha256 CHAR(64) NOT NULL PRIMARY KEY,
+                    agreement_reference VARCHAR(64) NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_agreement_files_reference (agreement_reference)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            # Migration: agreements tables created before duplicate handling lack these
+            cur.execute(
+                """
+                SELECT COUNT(*) AS n FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'agreements'
+                  AND COLUMN_NAME = 'updated_at'
+                """
+            )
+            if not cur.fetchone()["n"]:
+                cur.execute("ALTER TABLE agreements ADD COLUMN updated_at DATETIME NULL")
+                logger.info("Migrated agreements table: added updated_at column")
+            cur.execute(
+                """
+                SELECT COUNT(*) AS n FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'agreements'
+                  AND INDEX_NAME = 'idx_agreements_number_vendor'
+                """
+            )
+            if not cur.fetchone()["n"]:
+                cur.execute(
+                    "ALTER TABLE agreements "
+                    "ADD INDEX idx_agreements_number_vendor (agreement_number, vendor_customer)"
+                )
+                logger.info("Migrated agreements table: added agreement number/vendor index")
             # Jobs left 'processing' by a crash or restart would otherwise never run
             cur.execute(
                 "UPDATE extraction_jobs SET status = 'queued' WHERE status = 'processing'"
@@ -266,19 +304,21 @@ def db_insert_job(
     idempotency_key: Optional[str],
     file_sha256: str,
     file_ext: str,
-    file_path: str,
+    file_path: Optional[str],
     schema_version: str,
     priority: str,
     received_at: str,
+    result_json: Optional[str] = None,
 ):
+    """Insert a queued job, or an already 'completed' one when result_json is given (cache hit)."""
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO extraction_jobs (
-                    reference, idempotency_key, file_sha256, file_ext,
-                    file_path, schema_version, priority, status, received_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued', %s)
+                    reference, idempotency_key, file_sha256, file_ext, file_path,
+                    schema_version, priority, status, received_at, completed_at, result_json
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     reference,
@@ -288,7 +328,10 @@ def db_insert_job(
                     file_path,
                     schema_version,
                     priority,
+                    "completed" if result_json else "queued",
                     received_at,
+                    time.time() if result_json else None,
+                    result_json,
                 ),
             )
 
@@ -388,40 +431,129 @@ def db_cleanup_expired_jobs():
             )
 
 
-def db_save_agreement(reference: str, result: Dict[str, Any]):
-    """Permanently save the extracted values (not deleted after 7 days)."""
+def db_get_agreement_by_hash(file_sha256: str) -> Optional[Dict[str, Any]]:
+    """Return the saved agreement (reference, result_json) this exact file was linked to."""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT a.reference, a.result_json
+                FROM agreement_files f
+                JOIN agreements a ON a.reference = f.agreement_reference
+                WHERE f.file_sha256 = %s
+                """,
+                (file_sha256,),
+            )
+            return cur.fetchone()
+
+
+def db_save_agreement(
+    reference: str, result: Dict[str, Any], file_sha256: str
+) -> Tuple[str, Optional[str]]:
+    """
+    Permanently save the extracted values (not deleted after 7 days), without duplicates:
+    - same file already linked            -> keep the saved row, reason "same_file"
+    - same agreement_number + vendor      -> update that row in place, reason "same_agreement_number"
+    - anything else                       -> insert a new row under `reference`
+    The file is always linked to the stored row. Returns (stored_reference, duplicate_reason).
+    """
     fields = result.get("fields") or {}
 
     def val(key):
         return (fields.get(key) or {}).get("value")
 
     value_obj = val("value") or {}
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                REPLACE INTO agreements (
-                    reference, is_agreement, agreement_number, title, vendor_customer,
-                    start_date, expiry_date, value_amount, value_currency,
-                    warnings_json, result_json, created_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    reference,
-                    1 if result["document_classification"]["is_agreement"] else 0,
-                    val("agreement_number"),
-                    val("title"),
-                    val("vendor_customer"),
-                    val("start_date"),
-                    val("expiry_date"),
-                    value_obj.get("amount"),
-                    value_obj.get("currency"),
-                    json.dumps(result.get("warnings") or []),
-                    json.dumps(result),
-                    # DATETIME has no timezone; store naive UTC
-                    datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
-                ),
-            )
+    agreement_number = val("agreement_number")
+    vendor_customer = val("vendor_customer")
+    columns = (
+        1 if result["document_classification"]["is_agreement"] else 0,
+        agreement_number,
+        val("title"),
+        vendor_customer,
+        val("start_date"),
+        val("expiry_date"),
+        value_obj.get("amount"),
+        value_obj.get("currency"),
+        json.dumps(result.get("warnings") or []),
+        json.dumps(result),
+    )
+    # DATETIME has no timezone; store naive UTC
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+    # The FOR UPDATE locks make concurrent saves of the same agreement collide; InnoDB
+    # resolves that as a deadlock, and the retry then sees the row the winner saved.
+    for attempt in range(3):
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT a.reference
+                        FROM agreement_files f
+                        JOIN agreements a ON a.reference = f.agreement_reference
+                        WHERE f.file_sha256 = %s
+                        FOR UPDATE
+                        """,
+                        (file_sha256,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return row["reference"], "same_file"
+
+                    if agreement_number is not None:
+                        cur.execute(
+                            """
+                            SELECT reference FROM agreements
+                            WHERE agreement_number = %s AND vendor_customer <=> %s
+                            ORDER BY created_at ASC, reference ASC
+                            LIMIT 1
+                            FOR UPDATE
+                            """,
+                            (agreement_number, vendor_customer),
+                        )
+                        row = cur.fetchone()
+
+                    if row:
+                        stored_reference, reason = row["reference"], "same_agreement_number"
+                        cur.execute(
+                            """
+                            UPDATE agreements SET
+                                is_agreement = %s, agreement_number = %s, title = %s,
+                                vendor_customer = %s, start_date = %s, expiry_date = %s,
+                                value_amount = %s, value_currency = %s,
+                                warnings_json = %s, result_json = %s, updated_at = %s
+                            WHERE reference = %s
+                            """,
+                            (*columns, now, stored_reference),
+                        )
+                    else:
+                        stored_reference, reason = reference, None
+                        cur.execute(
+                            """
+                            INSERT INTO agreements (
+                                reference, is_agreement, agreement_number, title, vendor_customer,
+                                start_date, expiry_date, value_amount, value_currency,
+                                warnings_json, result_json, created_at
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (reference, *columns, now),
+                        )
+
+                    # Any existing link for this hash points at a deleted row (the join above
+                    # found nothing), so repoint it rather than ignoring the insert
+                    cur.execute(
+                        """
+                        INSERT INTO agreement_files (file_sha256, agreement_reference)
+                        VALUES (%s, %s)
+                        ON DUPLICATE KEY UPDATE agreement_reference = %s
+                        """,
+                        (file_sha256, stored_reference, stored_reference),
+                    )
+                    return stored_reference, reason
+        except pymysql.err.OperationalError as exc:
+            # 1213 = deadlock: the transaction was rolled back, safe to retry
+            if exc.args[0] != 1213 or attempt == 2:
+                raise
 
 
 def to_json_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -1192,6 +1324,17 @@ async def background_worker_loop():
                 continue
 
             try:
+                # The same file may have been saved while this job waited in the queue
+                cached = db_get_agreement_by_hash(job["file_sha256"])
+                if cached:
+                    db_mark_completed(ref, json.loads(cached["result_json"]))
+                    logger.info(
+                        "Completed job reference=%s from saved agreement=%s duplicate=same_file",
+                        ref,
+                        cached["reference"],
+                    )
+                    continue
+
                 with open(file_path, "rb") as f:
                     file_bytes = f.read()
 
@@ -1200,10 +1343,12 @@ async def background_worker_loop():
                     run_llm_extraction, file_bytes, file_ext
                 )
                 db_mark_completed(ref, result_dict)
-                db_save_agreement(ref, result_dict)
+                stored_ref, duplicate = db_save_agreement(ref, result_dict, job["file_sha256"])
                 logger.info(
-                    "Completed job reference=%s processing_ms=%d",
+                    "Completed job reference=%s agreement=%s duplicate=%s processing_ms=%d",
                     ref,
+                    stored_ref,
+                    duplicate,
                     result_dict.get("processing_ms", 0),
                 )
             except DocumentParseError as dpe:
@@ -1336,14 +1481,6 @@ async def submit_extraction(
             detail=f"Unsupported schema_version '{schema_version}'. Only '1.0' is supported.",
         )
 
-    queue_depth, _ = db_get_health_metrics()
-    if queue_depth >= MAX_QUEUE_DEPTH:
-        return JSONResponse(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            headers={"Retry-After": "60"},
-            content={"detail": "Extraction queue is currently full. Please retry later."},
-        )
-
     file_bytes = await file.read()
     ext = validate_upload_file(file, file_bytes)
     file_hash = hashlib.sha256(file_bytes).hexdigest()
@@ -1354,6 +1491,9 @@ async def submit_extraction(
         if existing:
             return idempotent_job_response(existing, file_hash)
 
+    # Exact same file already extracted: record a completed job with the saved result, no queueing
+    cached = db_get_agreement_by_hash(file_hash)
+
     reference = f"ext_{uuid.uuid4().hex[:26].upper()}"
     received_at = (
         datetime.datetime.now(datetime.timezone.utc)
@@ -1361,10 +1501,20 @@ async def submit_extraction(
         .isoformat()
         .replace("+00:00", "Z")
     )
-    temp_path = os.path.join(STORAGE_DIR, f"{reference}{ext}")
+    temp_path = None
 
-    with open(temp_path, "wb") as f:
-        f.write(file_bytes)
+    if not cached:
+        queue_depth, _ = db_get_health_metrics()
+        if queue_depth >= MAX_QUEUE_DEPTH:
+            return JSONResponse(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                headers={"Retry-After": "60"},
+                content={"detail": "Extraction queue is currently full. Please retry later."},
+            )
+
+        temp_path = os.path.join(STORAGE_DIR, f"{reference}{ext}")
+        with open(temp_path, "wb") as f:
+            f.write(file_bytes)
 
     try:
         db_insert_job(
@@ -1376,22 +1526,31 @@ async def submit_extraction(
             schema_version=schema_version,
             priority=priority,
             received_at=received_at,
+            result_json=cached["result_json"] if cached else None,
         )
     except pymysql.err.IntegrityError:
         # A concurrent request with the same Idempotency-Key inserted first
-        try:
-            os.remove(temp_path)
-        except OSError:
-            pass
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
         existing = db_get_by_idempotency(idempotency_key) if idempotency_key else None
         if not existing:
             raise
         return idempotent_job_response(existing, file_hash)
 
-    logger.info("Accepted job reference=%s priority=%s", reference, priority)
+    if cached:
+        logger.info(
+            "Accepted job reference=%s from saved agreement=%s duplicate=same_file",
+            reference,
+            cached["reference"],
+        )
+    else:
+        logger.info("Accepted job reference=%s priority=%s", reference, priority)
     return {
         "reference": reference,
-        "status": "queued",
+        "status": "completed" if cached else "queued",
         "received_at": received_at,
     }
 
@@ -1491,7 +1650,8 @@ async def list_agreements(_api_key: str = Depends(verify_api_key)):
             cur.execute(
                 """
                 SELECT reference, is_agreement, agreement_number, title, vendor_customer,
-                       start_date, expiry_date, value_amount, value_currency, created_at
+                       start_date, expiry_date, value_amount, value_currency,
+                       created_at, updated_at
                 FROM agreements ORDER BY created_at DESC
                 """
             )
@@ -1533,11 +1693,21 @@ async def extract_agreement_sync(file: UploadFile = File(...)):
     """
     file_bytes = await file.read()
     ext = validate_upload_file(file, file_bytes)
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+
+    cached = db_get_agreement_by_hash(file_hash)
+    if cached:
+        return {
+            "reference": cached["reference"],
+            "duplicate": "same_file",
+            **json.loads(cached["result_json"]),
+        }
+
     try:
         result = await asyncio.to_thread(run_llm_extraction, file_bytes, ext)
         reference = f"ext_{uuid.uuid4().hex[:26].upper()}"
-        db_save_agreement(reference, result)
-        return {"reference": reference, **result}
+        stored_ref, duplicate = db_save_agreement(reference, result, file_hash)
+        return {"reference": stored_ref, "duplicate": duplicate, **result}
     except DocumentParseError as dpe:
         raise HTTPException(status_code=400, detail={"code": dpe.code, "message": dpe.message})
 

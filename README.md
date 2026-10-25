@@ -302,6 +302,24 @@ multipart/form-data
 
 ---
 
+# Duplicate Handling
+
+The service avoids saving the same agreement twice in the `agreements` table:
+
+| Case | What happens |
+| ---- | ------------ |
+| Exact same file (same SHA-256) | The model is **not** run again. The saved result is returned immediately. `POST /v1/extractions` responds with `"status": "completed"` and the result is available from `/v1/extractions/status` straight away. |
+| Different file, same `agreement_number` and `vendor_customer` (e.g. a rescan) | The model runs, and the existing `agreements` row is **updated** (same reference, new `updated_at`) instead of inserting a new row. |
+| Anything else (including documents with no agreement number) | A new row is inserted. |
+
+Every processed file is linked to its agreement in the `agreement_files` table (`file_sha256` → `agreement_reference`), so an older copy of an agreement is still recognised after a rescan has updated the row.
+
+The legacy `POST /extract` endpoint returns the stored agreement's `reference` plus a `duplicate` field: `"same_file"`, `"same_agreement_number"` or `null`.
+
+On startup, `init_db()` adds the `updated_at` column and the `(agreement_number, vendor_customer)` index to an existing `agreements` table if they are missing; existing rows are kept.
+
+---
+
 # Model Information
 
 ## Model
