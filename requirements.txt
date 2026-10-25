@@ -6,4 +6,7 @@ pypdf==6.19.0
 pydantic==2.13.5
 python-docx>=1.1.2
 pymupdf>=1.24.0
-rapidocr-onnxruntime>=1.4.4
+rapidocr-onnxruntime>=1.4.4; python_version < "3.13"
+pymysql>=1.1.1
+cryptography>=43.0.0
+python-dotenv>=1.0.1
