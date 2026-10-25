@@ -71,6 +71,10 @@ The service extracts the following agreement details:
 - FastAPI
 - Uvicorn
 
+## Database
+
+- MySQL 8 (via PyMySQL)
+
 ## Document Processing
 
 - PyPDF
@@ -102,6 +106,42 @@ Before running the project, install:
 - Python 3.10 or higher
 - Ollama
 - Qwen2.5:7B model
+- MySQL 8.0 or higher
+
+---
+
+# MySQL Setup
+
+The service stores the extraction job queue and saved agreements in MySQL. The database and tables are created automatically on startup.
+
+## Install and Start MySQL (macOS)
+
+```bash
+brew install mysql
+brew services start mysql
+```
+
+Optionally set a root password:
+
+```bash
+mysql_secure_installation
+```
+
+## Configure Connection Settings
+
+Copy the example environment file and fill in your MySQL password and API keys:
+
+```bash
+cp .env.example .env
+```
+
+| Variable | Default | Description |
+|---|---|---|
+| MYSQL_HOST | 127.0.0.1 | MySQL server host |
+| MYSQL_PORT | 3306 | MySQL server port |
+| MYSQL_USER | root | MySQL user |
+| MYSQL_PASSWORD | (empty) | MySQL password |
+| MYSQL_DATABASE | amp_extraction | Database name (created if missing) |
 
 ---
 
