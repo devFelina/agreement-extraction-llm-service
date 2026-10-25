@@ -6,16 +6,18 @@ import json
 import logging
 import os
 import re
-import sqlite3
 import time
 import uuid
 import gc
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, Generator, List, Literal, Optional, Tuple, Union
 
 import ollama
+import pymysql
+import pymysql.cursors
 from docx import Document as DocxDocument
+from dotenv import load_dotenv
 from fastapi import (
     Depends,
     FastAPI,
@@ -46,6 +48,10 @@ try:
     from rapidocr_onnxruntime import RapidOCR
 except ImportError:
     RapidOCR = None
+
+# Load .env before any os.getenv() call below
+load_dotenv()
+
 # ==========================================================
 # LOGGING (REQ-NF-04: Never log document text, values, or filenames)
 # ==========================================================
@@ -60,7 +66,6 @@ logger = logging.getLogger("amp_extraction")
 # ==========================================================
 MODEL_NAME = os.getenv("MODEL_NAME", "qwen2.5:7b")
 MODEL_VERSION = os.getenv("MODEL_VERSION", "1.1.0-qwen2.5-7b")
-DB_PATH = os.getenv("DB_PATH", "extractions_queue.db")
 STORAGE_DIR = os.getenv("TEMP_STORAGE_DIR", "temp_uploads")
 
 # REQ-DOC-02 & REQ-DOC-03 Limits
@@ -69,6 +74,17 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 MAX_PAGES = int(os.getenv("MAX_PAGES", "150"))
 MAX_QUEUE_DEPTH = int(os.getenv("MAX_QUEUE_DEPTH", "500"))
 RETENTION_DAYS = 7
+
+# MySQL connection settings
+MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
+MYSQL_USER = os.getenv("MYSQL_USER", "root")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
+MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "amp_extraction")
+
+# The database name is interpolated into CREATE DATABASE, so restrict it to a safe identifier
+if not re.fullmatch(r"[A-Za-z0-9_]+", MYSQL_DATABASE):
+    raise RuntimeError("MYSQL_DATABASE may only contain letters, digits and underscores.")
 
 # REQ-SEC-02: Accept two active API keys at once for zero-downtime rotation
 API_KEY_PRIMARY = os.getenv("AMP_API_KEY_PRIMARY", "amp-dev-key-primary-2026")
@@ -149,66 +165,100 @@ class BatchStatusRequest(BaseModel):
 
 
 # ==========================================================
-# PERSISTENT SQLITE JOB STORE (REQ-OPS-02, REQ-API-06, REQ-API-08)
+# PERSISTENT MYSQL JOB STORE (REQ-OPS-02, REQ-API-06, REQ-API-08)
 # ==========================================================
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS extraction_jobs (
-                reference TEXT PRIMARY KEY,
-                idempotency_key TEXT UNIQUE,
-                file_sha256 TEXT NOT NULL,
-                file_ext TEXT NOT NULL,
-                file_path TEXT,
-                schema_version TEXT NOT NULL DEFAULT '1.0',
-                priority TEXT NOT NULL DEFAULT 'interactive',
-                status TEXT NOT NULL DEFAULT 'queued',
-                received_at TEXT NOT NULL,
-                completed_at REAL,
-                result_json TEXT,
-                error_json TEXT
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS agreements (
-                reference TEXT PRIMARY KEY,
-                is_agreement INTEGER,
-                agreement_number TEXT,
-                title TEXT,
-                vendor_customer TEXT,
-                start_date TEXT,
-                expiry_date TEXT,
-                value_amount TEXT,
-                value_currency TEXT,
-                warnings_json TEXT,
-                result_json TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
+@contextmanager
+def get_db(use_database: bool = True) -> Generator[pymysql.connections.Connection, None, None]:
+    """Open a connection; commit on success, roll back on error, always close."""
+    conn = pymysql.connect(
+        host=MYSQL_HOST,
+        port=MYSQL_PORT,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=MYSQL_DATABASE if use_database else None,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=False,
+    )
+    try:
+        yield conn
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db():
+    with get_db(use_database=False) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"CREATE DATABASE IF NOT EXISTS `{MYSQL_DATABASE}` "
+                "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+            )
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS extraction_jobs (
+                    reference VARCHAR(64) NOT NULL PRIMARY KEY,
+                    idempotency_key VARCHAR(255) NULL UNIQUE,
+                    file_sha256 CHAR(64) NOT NULL,
+                    file_ext VARCHAR(10) NOT NULL,
+                    file_path VARCHAR(512) NULL,
+                    schema_version VARCHAR(16) NOT NULL DEFAULT '1.0',
+                    priority VARCHAR(16) NOT NULL DEFAULT 'interactive',
+                    status VARCHAR(16) NOT NULL DEFAULT 'queued',
+                    received_at VARCHAR(32) NOT NULL,
+                    completed_at DOUBLE NULL,
+                    result_json LONGTEXT NULL,
+                    error_json TEXT NULL,
+                    INDEX idx_jobs_queue (status, priority, received_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agreements (
+                    reference VARCHAR(64) NOT NULL PRIMARY KEY,
+                    is_agreement TINYINT(1) NULL,
+                    agreement_number VARCHAR(100) NULL,
+                    title VARCHAR(255) NULL,
+                    vendor_customer VARCHAR(255) NULL,
+                    start_date DATE NULL,
+                    expiry_date DATE NULL,
+                    value_amount DECIMAL(15,2) NULL,
+                    value_currency CHAR(3) NULL,
+                    warnings_json TEXT NULL,
+                    result_json LONGTEXT NOT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            # Jobs left 'processing' by a crash or restart would otherwise never run
+            cur.execute(
+                "UPDATE extraction_jobs SET status = 'queued' WHERE status = 'processing'"
+            )
+            if cur.rowcount:
+                logger.info("Re-queued %d job(s) interrupted mid-processing", cur.rowcount)
 
 
 def db_get_by_idempotency(idem_key: str) -> Optional[Dict[str, Any]]:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT * FROM extraction_jobs WHERE idempotency_key = ?", (idem_key,)
-        ).fetchone()
-        return dict(row) if row else None
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM extraction_jobs WHERE idempotency_key = %s", (idem_key,)
+            )
+            return cur.fetchone()
 
 
 def db_get_by_reference(ref: str) -> Optional[Dict[str, Any]]:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT * FROM extraction_jobs WHERE reference = ?", (ref,)
-        ).fetchone()
-        return dict(row) if row else None
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM extraction_jobs WHERE reference = %s", (ref,))
+            return cur.fetchone()
 
 
 def db_insert_job(
@@ -221,117 +271,121 @@ def db_insert_job(
     priority: str,
     received_at: str,
 ):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            INSERT INTO extraction_jobs (
-                reference, idempotency_key, file_sha256, file_ext,
-                file_path, schema_version, priority, status, received_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)
-            """,
-            (
-                reference,
-                idempotency_key,
-                file_sha256,
-                file_ext,
-                file_path,
-                schema_version,
-                priority,
-                received_at,
-            ),
-        )
-        conn.commit()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO extraction_jobs (
+                    reference, idempotency_key, file_sha256, file_ext,
+                    file_path, schema_version, priority, status, received_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued', %s)
+                """,
+                (
+                    reference,
+                    idempotency_key,
+                    file_sha256,
+                    file_ext,
+                    file_path,
+                    schema_version,
+                    priority,
+                    received_at,
+                ),
+            )
 
 
 def db_fetch_next_queued_job() -> Optional[Dict[str, Any]]:
-    """REQ-PERF-03: interactive jobs MUST go before bulk jobs."""
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            """
-            SELECT * FROM extraction_jobs
-            WHERE status = 'queued'
-            ORDER BY CASE WHEN priority = 'interactive' THEN 0 ELSE 1 END ASC,
-                     received_at ASC
-            LIMIT 1
-            """
-        ).fetchone()
-        if not row:
-            return None
-        job = dict(row)
-        conn.execute(
-            "UPDATE extraction_jobs SET status = 'processing' WHERE reference = ?",
-            (job["reference"],),
-        )
-        conn.commit()
-        return job
+    """
+    REQ-PERF-03: interactive jobs MUST go before bulk jobs.
+    FOR UPDATE SKIP LOCKED lets several workers claim jobs without picking the same one.
+    """
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM extraction_jobs
+                WHERE status = 'queued'
+                ORDER BY CASE WHEN priority = 'interactive' THEN 0 ELSE 1 END ASC,
+                         received_at ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+                """
+            )
+            job = cur.fetchone()
+            if not job:
+                return None
+            cur.execute(
+                "UPDATE extraction_jobs SET status = 'processing' WHERE reference = %s",
+                (job["reference"],),
+            )
+            return job
 
 
 def db_mark_completed(reference: str, result_dict: Dict[str, Any]):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            UPDATE extraction_jobs
-            SET status = 'completed', completed_at = ?, result_json = ?, file_path = NULL
-            WHERE reference = ?
-            """,
-            (time.time(), json.dumps(result_dict), reference),
-        )
-        conn.commit()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE extraction_jobs
+                SET status = 'completed', completed_at = %s, result_json = %s, file_path = NULL
+                WHERE reference = %s
+                """,
+                (time.time(), json.dumps(result_dict), reference),
+            )
 
 
 def db_mark_failed(reference: str, code: str, message: str, retryable: bool):
     error_obj = {"code": code, "message": message, "retryable": retryable}
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            UPDATE extraction_jobs
-            SET status = 'failed', completed_at = ?, error_json = ?, file_path = NULL
-            WHERE reference = ?
-            """,
-            (time.time(), json.dumps(error_obj), reference),
-        )
-        conn.commit()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE extraction_jobs
+                SET status = 'failed', completed_at = %s, error_json = %s, file_path = NULL
+                WHERE reference = %s
+                """,
+                (time.time(), json.dumps(error_obj), reference),
+            )
 
 
 def db_delete_job(reference: str) -> Optional[Dict[str, Any]]:
     job = db_get_by_reference(reference)
     if job:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("DELETE FROM extraction_jobs WHERE reference = ?", (reference,))
-            conn.commit()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM extraction_jobs WHERE reference = %s", (reference,))
     return job
 
 
 def db_get_health_metrics() -> Tuple[int, Optional[int]]:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            """
-            SELECT COUNT(*) as depth, MIN(received_at) as oldest
-            FROM extraction_jobs
-            WHERE status = 'queued'
-            """
-        ).fetchone()
-        depth = row["depth"] if row else 0
-        oldest_str = row["oldest"] if row else None
-        oldest_age = None
-        if oldest_str and depth > 0:
-            oldest_dt = datetime.datetime.fromisoformat(oldest_str.replace("Z", "+00:00"))
-            now_dt = datetime.datetime.now(datetime.timezone.utc)
-            oldest_age = max(0, int((now_dt - oldest_dt).total_seconds()))
-        return depth, oldest_age
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) AS depth, MIN(received_at) AS oldest
+                FROM extraction_jobs
+                WHERE status = 'queued'
+                """
+            )
+            row = cur.fetchone()
+    depth = row["depth"] if row else 0
+    oldest_str = row["oldest"] if row else None
+    oldest_age = None
+    if oldest_str and depth > 0:
+        oldest_dt = datetime.datetime.fromisoformat(oldest_str.replace("Z", "+00:00"))
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        oldest_age = max(0, int((now_dt - oldest_dt).total_seconds()))
+    return depth, oldest_age
 
 
 def db_cleanup_expired_jobs():
     """REQ-API-08 & REQ-NF-03: Purge results older than 7 days."""
     cutoff = time.time() - (RETENTION_DAYS * 86400)
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "DELETE FROM extraction_jobs WHERE completed_at IS NOT NULL AND completed_at < ?",
-            (cutoff,),
-        )
-        conn.commit()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM extraction_jobs WHERE completed_at IS NOT NULL AND completed_at < %s",
+                (cutoff,),
+            )
 
 
 def db_save_agreement(reference: str, result: Dict[str, Any]):
@@ -342,31 +396,48 @@ def db_save_agreement(reference: str, result: Dict[str, Any]):
         return (fields.get(key) or {}).get("value")
 
     value_obj = val("value") or {}
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO agreements (
-                reference, is_agreement, agreement_number, title, vendor_customer,
-                start_date, expiry_date, value_amount, value_currency,
-                warnings_json, result_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                reference,
-                1 if result["document_classification"]["is_agreement"] else 0,
-                val("agreement_number"),
-                val("title"),
-                val("vendor_customer"),
-                val("start_date"),
-                val("expiry_date"),
-                value_obj.get("amount"),
-                value_obj.get("currency"),
-                json.dumps(result.get("warnings") or []),
-                json.dumps(result),
-                datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            ),
-        )
-        conn.commit()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                REPLACE INTO agreements (
+                    reference, is_agreement, agreement_number, title, vendor_customer,
+                    start_date, expiry_date, value_amount, value_currency,
+                    warnings_json, result_json, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    reference,
+                    1 if result["document_classification"]["is_agreement"] else 0,
+                    val("agreement_number"),
+                    val("title"),
+                    val("vendor_customer"),
+                    val("start_date"),
+                    val("expiry_date"),
+                    value_obj.get("amount"),
+                    value_obj.get("currency"),
+                    json.dumps(result.get("warnings") or []),
+                    json.dumps(result),
+                    # DATETIME has no timezone; store naive UTC
+                    datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
+                ),
+            )
+
+
+def to_json_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert MySQL DATE / DATETIME / DECIMAL values to strings for JSON responses."""
+    out = {}
+    for k, v in row.items():
+        if isinstance(v, datetime.datetime):
+            # created_at is stored as UTC; keep the "+00:00" ISO form the API returned before
+            out[k] = v.replace(tzinfo=datetime.timezone.utc).isoformat()
+        elif isinstance(v, datetime.date):
+            out[k] = v.isoformat()
+        elif isinstance(v, Decimal):
+            out[k] = str(v)
+        else:
+            out[k] = v
+    return out
 
 
 # ==========================================================
@@ -1221,6 +1292,22 @@ def validate_upload_file(file: UploadFile, file_bytes: bytes) -> str:
     return ext
 
 
+def idempotent_job_response(existing: Dict[str, Any], file_hash: str) -> Dict[str, Any]:
+    """REQ-API-06: Replay the original job for a reused Idempotency-Key, or 409 on a different file."""
+    if existing["file_sha256"] != file_hash:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Idempotency-Key has already been used with a different file payload.",
+        )
+    return {
+        "reference": existing["reference"],
+        "status": existing["status"]
+        if existing["status"] in ("queued", "processing", "completed", "failed")
+        else "queued",
+        "received_at": existing["received_at"],
+    }
+
+
 # ==========================================================
 # SECTION 5.2: AMP /v1 API ENDPOINTS
 # ==========================================================
@@ -1265,18 +1352,7 @@ async def submit_extraction(
     if idempotency_key:
         existing = db_get_by_idempotency(idempotency_key)
         if existing:
-            if existing["file_sha256"] != file_hash:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Idempotency-Key has already been used with a different file payload.",
-                )
-            return {
-                "reference": existing["reference"],
-                "status": existing["status"]
-                if existing["status"] in ("queued", "processing", "completed", "failed")
-                else "queued",
-                "received_at": existing["received_at"],
-            }
+            return idempotent_job_response(existing, file_hash)
 
     reference = f"ext_{uuid.uuid4().hex[:26].upper()}"
     received_at = (
@@ -1290,16 +1366,27 @@ async def submit_extraction(
     with open(temp_path, "wb") as f:
         f.write(file_bytes)
 
-    db_insert_job(
-        reference=reference,
-        idempotency_key=idempotency_key,
-        file_sha256=file_hash,
-        file_ext=ext,
-        file_path=temp_path,
-        schema_version=schema_version,
-        priority=priority,
-        received_at=received_at,
-    )
+    try:
+        db_insert_job(
+            reference=reference,
+            idempotency_key=idempotency_key,
+            file_sha256=file_hash,
+            file_ext=ext,
+            file_path=temp_path,
+            schema_version=schema_version,
+            priority=priority,
+            received_at=received_at,
+        )
+    except pymysql.err.IntegrityError:
+        # A concurrent request with the same Idempotency-Key inserted first
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        existing = db_get_by_idempotency(idempotency_key) if idempotency_key else None
+        if not existing:
+            raise
+        return idempotent_job_response(existing, file_hash)
 
     logger.info("Accepted job reference=%s priority=%s", reference, priority)
     return {
@@ -1399,27 +1486,30 @@ async def get_health():
 # ==========================================================
 @app.get("/v1/agreements", tags=["Saved Agreements"])
 async def list_agreements(_api_key: str = Depends(verify_api_key)):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            """
-            SELECT reference, is_agreement, agreement_number, title, vendor_customer,
-                   start_date, expiry_date, value_amount, value_currency, created_at
-            FROM agreements ORDER BY created_at DESC
-            """
-        ).fetchall()
-    return [dict(r) for r in rows]
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT reference, is_agreement, agreement_number, title, vendor_customer,
+                       start_date, expiry_date, value_amount, value_currency, created_at
+                FROM agreements ORDER BY created_at DESC
+                """
+            )
+            rows = cur.fetchall()
+    return [to_json_row(r) for r in rows]
 
 
 @app.get("/v1/agreements/{reference}", tags=["Saved Agreements"])
 async def get_agreement(reference: str, _api_key: str = Depends(verify_api_key)):
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT result_json FROM agreements WHERE reference = ?", (reference,)
-        ).fetchone()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT result_json FROM agreements WHERE reference = %s", (reference,)
+            )
+            row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Agreement not found.")
-    return json.loads(row[0])
+    return json.loads(row["result_json"])
 
 
 # ==========================================================
