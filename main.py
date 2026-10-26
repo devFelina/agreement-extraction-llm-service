@@ -1437,6 +1437,16 @@ def validate_upload_file(file: UploadFile, file_bytes: bytes) -> str:
     return ext
 
 
+# Shown to clients when an upload matches an agreement that is already saved
+DUPLICATE_MESSAGES = {
+    "same_file": "Agreement details already saved. Returning the saved result.",
+    "same_agreement_number": (
+        "Agreement details already saved under this agreement number. "
+        "The saved record was updated with this document's details."
+    ),
+}
+
+
 def idempotent_job_response(existing: Dict[str, Any], file_hash: str) -> Dict[str, Any]:
     """REQ-API-06: Replay the original job for a reused Idempotency-Key, or 409 on a different file."""
     if existing["file_sha256"] != file_hash:
@@ -1548,11 +1558,18 @@ async def submit_extraction(
         )
     else:
         logger.info("Accepted job reference=%s priority=%s", reference, priority)
-    return {
+    response = {
         "reference": reference,
         "status": "completed" if cached else "queued",
         "received_at": received_at,
     }
+    if cached:
+        response.update(
+            duplicate="same_file",
+            agreement_reference=cached["reference"],
+            message=DUPLICATE_MESSAGES["same_file"],
+        )
+    return response
 
 
 @app.post("/v1/extractions/status", status_code=status.HTTP_200_OK, tags=["AMP v1 Contract"])
@@ -1700,6 +1717,7 @@ async def extract_agreement_sync(file: UploadFile = File(...)):
         return {
             "reference": cached["reference"],
             "duplicate": "same_file",
+            "message": DUPLICATE_MESSAGES["same_file"],
             **json.loads(cached["result_json"]),
         }
 
@@ -1707,7 +1725,12 @@ async def extract_agreement_sync(file: UploadFile = File(...)):
         result = await asyncio.to_thread(run_llm_extraction, file_bytes, ext)
         reference = f"ext_{uuid.uuid4().hex[:26].upper()}"
         stored_ref, duplicate = db_save_agreement(reference, result, file_hash)
-        return {"reference": stored_ref, "duplicate": duplicate, **result}
+        return {
+            "reference": stored_ref,
+            "duplicate": duplicate,
+            "message": DUPLICATE_MESSAGES.get(duplicate, "Agreement details saved."),
+            **result,
+        }
     except DocumentParseError as dpe:
         raise HTTPException(status_code=400, detail={"code": dpe.code, "message": dpe.message})
 
